@@ -202,7 +202,7 @@ log.close(function () {
 ### Third party adapters
 You can force using custom adapter by setting the `adapter` right after initialisation.  The [signature](lib/adapter/abstract.js) might be found here. 
 ```javascript
-  var log = require('gelf-pro');
+  var log = require('gelf-pro-plus');
   var myFancyAdapter = require('...');
   log.adapter = myFancyAdapter;
   // (!) adapterName and adapterOptions will be ignored
@@ -223,8 +223,8 @@ npm test
 
 #### Docker
 ```bash
-[sudo] docker build --no-cache -t node-gelf-pro .
-[sudo] docker run -ti --rm -v "${PWD}:/opt/app" -w "/opt/app" node-gelf-pro
+[sudo] docker build --no-cache -t node-gelf-pro-plus .
+[sudo] docker run -ti --rm -v "${PWD}:/opt/app" -w "/opt/app" node-gelf-pro-plus
 ```
 
 #### Contributors
