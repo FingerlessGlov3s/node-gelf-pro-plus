@@ -1,38 +1,30 @@
-`gelf-pro`
+`gelf-pro-plus`
 =============
 [Graylog2](https://github.com/Graylog2/graylog2-server) client library for Node.js. Sends logs to Graylog2 server in GELF (Graylog Extended Log Format) format.
+
+> **Fork notice:** This is a fork of [`gelf-pro`](https://github.com/kkamkou/node-gelf-pro) by [Kanstantsin Kamkou](https://github.com/kkamkou).
+> It adds persistent TCP connection reuse (`keepAlive`) for high-throughput scenarios, with automatic reconnection, message queuing, and backoff.
+> All credit for the original library goes to the original author and contributors.
 
 **Features:**
 - JS object marshalling
 - UDP/TCP/TLS support
+- Persistent TCP connection reuse with automatic reconnection
 - Filtering, Transforming, Broadcasting.
-
-![Build Status](https://github.com/kkamkou/node-gelf-pro/actions/workflows/node.js.yml/badge.svg?branch=master)
-![Coverage Status](https://coveralls.io/repos/github/kkamkou/node-gelf-pro/badge.svg?branch=master)
 
 ## Installation
 ```
-"dependencies": {
-  "gelf-pro": "~1.4" // see the "releases" section
-}
+npm install gelf-pro-plus
 ```
-
-`npm install gelf-pro` (**ALL** node.js versions are supported [0.x to 2x.x] :)
 
 Library only depends on: `lodash#~4.17`
 
 ## Initialization
 ```javascript
-var log = require('gelf-pro');
+var log = require('gelf-pro-plus');
 ```
 
 ### Adapters
-
-> [!WARNING]
-> To ensure consistent behavior, **none of the existing adapters re-use the socket connection**. Re-using socket connections can lead to resource leakage, complexity in state management, concurrency issues, security risks, and may not always provide significant performance benefits.
-> It's often simpler and safer to establish new connections as needed rather than re-using existing ones, ensuring better resource utilization and reducing potential complications in network communication.
->
-> There are multiple ([1](https://github.com/kkamkou/node-gelf-pro/pull/68), [2](https://github.com/fdelayen/node-gelf-pro/commit/b52b4b6b1ff26772314b8673dd6fd724c0937caa)) variants available for you to borrow from and create a new adapter. [See related section](#third-party-adapters).
 
 - UDP (with deflation and chunking)
   - Input: `GELF UDP`
@@ -40,6 +32,11 @@ var log = require('gelf-pro');
   - Input: `GELF TCP` (with `Null frame delimiter`)
 - TCP via TLS(SSL)
   - Input: `GELF TCP` (with `Null frame delimiter` and `Enable TLS`)
+
+> [!NOTE]
+> By default, the TCP and TCP-TLS adapters create a new connection for each message.
+> For high-throughput use cases, you can enable persistent connection reuse with the `keepAlive` option.
+> See [TCP Connection Reuse](#tcp-connection-reuse) below.
 
 
 > [!NOTE]
@@ -70,6 +67,7 @@ log.setConfig({
     // tcp adapter example
     family: 4, // tcp only; optional; version of IP stack; default: 4
     timeout: 1000, // tcp only; optional; default: 10000 (10 sec)
+    keepAlive: false, // tcp/tcp-tls only; optional; enable persistent connection reuse; default: false
     
     // udp adapter example
     protocol: 'udp4', // udp only; optional; udp adapter: udp4, udp6; default: udp4
@@ -160,6 +158,46 @@ Default:
 `{emergency: 0, alert: 1, critical: 2, error: 3, warning: 4, notice: 5, info: 6, debug: 7}`  
 Example: `log.emergency(...)`, `log.critical(...)`, etc.  
 Custom example: `{alert: 0, notice: 1, ...}`
+
+### TCP Connection Reuse
+
+By default, the `tcp` and `tcp-tls` adapters create a new connection for every message. For high-throughput scenarios (e.g. hundreds of messages per second), you can enable persistent connection reuse with the `keepAlive` option.
+
+When enabled, the adapter maintains a single TCP connection, queues messages during outages, and automatically reconnects with exponential backoff.
+
+```javascript
+log.setConfig({
+  adapterName: 'tcp', // also works with 'tcp-tls'
+  adapterOptions: {
+    host: '127.0.0.1',
+    port: 12201,
+    keepAlive: true,
+    keepAliveOptions: {
+      maxQueueSize: 5000,         // max messages buffered while disconnected; default: 5000
+      reconnectBaseDelay: 100,    // initial reconnect delay in ms; default: 100
+      reconnectMaxDelay: 5000,    // max reconnect delay in ms (backoff cap); default: 5000
+      reconnectMaxAttempts: 0,    // 0 = unlimited retries; default: 0
+      writeTimeout: 5000,         // per-message write timeout in ms; default: 5000
+      queueFullBehavior: 'drop-oldest' // 'drop-oldest', 'drop-newest', or 'error'; default: 'drop-oldest'
+    }
+  }
+});
+```
+
+When you are done, close the connection to clean up:
+```javascript
+log.close(function () {
+  console.log('GELF connection closed');
+});
+```
+
+**How it works:**
+- Messages are queued and sent over a single persistent connection using `socket.write()`
+- If the connection drops, messages are buffered and the adapter reconnects automatically
+- Reconnection uses exponential backoff: `100ms -> 200ms -> 400ms -> ... -> 5s (cap)`
+- In-flight messages that fail mid-write are re-queued and retried
+- When the queue is full, the oldest messages are dropped by default (configurable)
+- Message timestamps are set when `log.info()` is called, not when delivered, so queued messages retain their original timestamps
 
 ### Third party adapters
 You can force using custom adapter by setting the `adapter` right after initialisation.  The [signature](lib/adapter/abstract.js) might be found here. 

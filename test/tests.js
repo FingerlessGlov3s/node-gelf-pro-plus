@@ -511,6 +511,193 @@ module.exports = {
     }
   },
 
+  'Adapter TCP (keepAlive)': {
+    beforeEach: function () {
+      this.adapter = getAdapter('tcp');
+
+      this.eventEmitter = new events.EventEmitter();
+      this.eventEmitter.destroy = sinon.stub();
+      this.eventEmitter.end = sinon.stub();
+      this.eventEmitter.write = sinon.stub();
+      this.eventEmitter.setTimeout = sinon.stub();
+      this.eventEmitter.removeAllListeners = sinon.stub();
+
+      sinon.stub(this.adapter, '_instance').returns(this.eventEmitter);
+      this.adapter.setOptions({
+        host: 'localhost', port: 5555,
+        keepAlive: true,
+        keepAliveOptions: {maxQueueSize: 10, reconnectBaseDelay: 10}
+      });
+    },
+
+    afterEach: function () {
+      this.adapter.close();
+    },
+
+    'Send message over persistent connection': function (done) {
+      this.eventEmitter.write.callsArg(1);
+
+      this.adapter.send('hello', function (err, result) {
+        should.not.exist(err);
+        result.should.equal(6);
+        done();
+      });
+
+      this.eventEmitter.emit('connect');
+    },
+
+    'Reuse connection for multiple messages': function (done) {
+      var self = this;
+      var count = 0;
+      this.eventEmitter.write.callsArg(1);
+
+      var check = function (err, result) {
+        should.not.exist(err);
+        if (++count === 3) {
+          self.adapter._instance.calledOnce.should.be.true();
+          done();
+        }
+      };
+
+      this.adapter.send('msg1', check);
+      this.adapter.send('msg2', check);
+      this.adapter.send('msg3', check);
+
+      this.eventEmitter.emit('connect');
+    },
+
+    'Queue messages while connecting': function (done) {
+      var results = [];
+      this.eventEmitter.write.callsArg(1);
+
+      var check = function (err, result) {
+        should.not.exist(err);
+        results.push(result);
+        if (results.length === 2) {
+          done();
+        }
+      };
+
+      this.adapter.send('msg1', check);
+      this.adapter.send('msg2', check);
+
+      this.eventEmitter.emit('connect');
+    },
+
+    'Reconnect after connection error': function (done) {
+      var self = this;
+
+      this.adapter.send('hello', function (err, result) {
+        should.not.exist(err);
+        result.should.equal(6);
+        done();
+      });
+
+      // first connection fails
+      this.eventEmitter.emit('error', new Error('ECONNREFUSED'));
+
+      // set up second connection
+      var emitter2 = new events.EventEmitter();
+      emitter2.destroy = sinon.stub();
+      emitter2.end = sinon.stub();
+      emitter2.write = sinon.stub().callsArg(1);
+      emitter2.setTimeout = sinon.stub();
+      emitter2.removeAllListeners = sinon.stub();
+      self.adapter._instance.returns(emitter2);
+
+      setTimeout(function () {
+        emitter2.emit('connect');
+      }, 50);
+    },
+
+    'Drop oldest message on queue overflow': function (done) {
+      this.adapter.setOptions({
+        host: 'localhost', port: 5555,
+        keepAlive: true,
+        keepAliveOptions: {maxQueueSize: 2, reconnectBaseDelay: 100000}
+      });
+
+      var dropped = false;
+      this.adapter.send('msg1', function (err) {
+        if (err && err.message.match(/overflow/)) { dropped = true; }
+      });
+      this.adapter.send('msg2', function () {});
+
+      // this triggers overflow, dropping msg1
+      this.adapter.send('msg3', function () {
+        // msg3 callback is not relevant here
+      });
+
+      process.nextTick(function () {
+        dropped.should.be.true();
+        done();
+      });
+    },
+
+    'Close errors all queued messages': function (done) {
+      var errors = [];
+      this.adapter.send('msg1', function (err) { if (err) { errors.push(err); } });
+      this.adapter.send('msg2', function (err) { if (err) { errors.push(err); } });
+
+      this.adapter.close(function () {
+        errors.should.have.length(2);
+        errors[0].message.should.equal('Adapter closed');
+        errors[1].message.should.equal('Adapter closed');
+        done();
+      });
+    },
+
+    'Re-queue in-flight message on disconnect': function (done) {
+      var self = this;
+
+      // first write: don't call the callback, then disconnect
+      this.eventEmitter.write.onFirstCall().callsFake(function () {
+        process.nextTick(function () {
+          self.eventEmitter.emit('error', new Error('Connection lost'));
+        });
+      });
+
+      this.adapter.send('hello', function (err, result) {
+        should.not.exist(err);
+        result.should.equal(6);
+        done();
+      });
+
+      this.eventEmitter.emit('connect');
+
+      // set up second connection for reconnect
+      var emitter2 = new events.EventEmitter();
+      emitter2.destroy = sinon.stub();
+      emitter2.end = sinon.stub();
+      emitter2.write = sinon.stub().callsArg(1);
+      emitter2.setTimeout = sinon.stub();
+      emitter2.removeAllListeners = sinon.stub();
+      self.adapter._instance.returns(emitter2);
+
+      setTimeout(function () {
+        emitter2.emit('connect');
+      }, 50);
+    },
+
+    'Legacy mode still works when keepAlive not set': function (done) {
+      var adapter = getAdapter('tcp');
+      var ee = new events.EventEmitter();
+      ee.destroy = sinon.stub();
+      ee.end = sinon.stub().callsArg(1);
+      ee.setTimeout = sinon.stub();
+      sinon.stub(adapter, '_instance').returns(ee);
+      adapter.setOptions({timeout: 500});
+
+      adapter.send('hello', function (err, result) {
+        should.not.exist(err);
+        result.should.equal(6);
+        done();
+      });
+
+      ee.emit('connect');
+    }
+  },
+
   'Adapter TCP(TLS)': {
     'Abstract functionality': function () {
       var tls = require('tls'),

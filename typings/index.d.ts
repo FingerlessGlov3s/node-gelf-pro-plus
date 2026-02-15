@@ -32,6 +32,8 @@ declare module 'gelf-pro' {
 
   export function message(message: Message, lvl: number, extra?: MessageExtra, callback?: MessageCallback): void;
 
+  export function close(callback?: () => void): void;
+
   export interface Logger {
     setConfig(opts: Partial<Settings>): Logger;
 
@@ -42,12 +44,16 @@ declare module 'gelf-pro' {
     send(message: Message, callback: MessageCallback): void;
 
     message(message: Message, lvl: number, extra?: any, callback?: MessageCallback): void;
+
+    close(callback?: () => void): void;
   }
 
   export interface Adapter {
     setOptions(options: any): Adapter;
 
     send(message: Message, callback: MessageCallback): void;
+
+    close(callback?: () => void): void;
   }
 
   export interface Settings {
@@ -93,9 +99,49 @@ declare module 'gelf-pro' {
        */
       family?: number;
       /**
-       * @default 1000
+       * @default 10000
        */
       timeout?: number;
+      /**
+       * Enable persistent TCP connection reuse
+       * @default false
+       */
+      keepAlive?: boolean;
+      /**
+       * Options for keepAlive mode (only used when keepAlive is true)
+       */
+      keepAliveOptions?: {
+        /**
+         * Max messages buffered while disconnected
+         * @default 5000
+         */
+        maxQueueSize?: number;
+        /**
+         * Initial reconnect delay in ms
+         * @default 100
+         */
+        reconnectBaseDelay?: number;
+        /**
+         * Maximum reconnect delay in ms (cap for exponential backoff)
+         * @default 5000
+         */
+        reconnectMaxDelay?: number;
+        /**
+         * Maximum reconnect attempts (0 = unlimited)
+         * @default 0
+         */
+        reconnectMaxAttempts?: number;
+        /**
+         * Per-message write timeout in ms
+         * @default 5000
+         */
+        writeTimeout?: number;
+        /**
+         * Behavior when message queue is full
+         * @default 'drop-oldest'
+         */
+        queueFullBehavior?: 'drop-oldest' | 'drop-newest' | 'error';
+      };
       /**
        * @default udp4
        */

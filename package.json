@@ -1,10 +1,10 @@
 {
-  "name": "gelf-pro",
-  "version": "1.4.0",
+  "name": "gelf-pro-plus",
+  "version": "1.5.0",
   "main": "./lib/gelf-pro.js",
   "typings": "./typings/index.d.ts",
   "author": "Kanstantsin Kamkou <kkamkou@gmail.com>",
-  "description": "The Graylog Extended Log Format for the Node.js",
+  "description": "Graylog Extended Log Format for Node.js - fork of gelf-pro with persistent TCP connection reuse",
   "keywords": [
     "graylog",
     "graylog2",
@@ -17,10 +17,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/kkamkou/node-gelf-pro.git"
+    "url": "https://github.com/FingerlessGlov3s/node-gelf-pro-plus.git"
   },
   "bugs": {
-    "url": "https://github.com/kkamkou/node-gelf-pro/issues"
+    "url": "https://github.com/FingerlessGlov3s/node-gelf-pro-plus/issues"
   },
   "license": "MIT",
   "scripts": {
