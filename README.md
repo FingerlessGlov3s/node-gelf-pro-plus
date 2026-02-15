@@ -229,6 +229,7 @@ npm test
 
 #### Contributors
 
+- [Kanstantsin Kamkou](https://github.com/kkamkou)
 - [corbinu](https://github.com/corbinu)
 - [joelharkes](https://github.com/joelharkes)
 - [mkalam-alami](https://github.com/mkalam-alami)
