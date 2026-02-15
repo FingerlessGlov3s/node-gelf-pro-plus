@@ -1,6 +1,6 @@
 {
   "name": "gelf-pro-plus",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "main": "./lib/gelf-pro.js",
   "typings": "./typings/index.d.ts",
   "author": "Kanstantsin Kamkou <kkamkou@gmail.com>",

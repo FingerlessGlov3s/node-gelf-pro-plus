@@ -9,7 +9,7 @@
 **Features:**
 - JS object marshalling
 - UDP/TCP/TLS support
-- Persistent TCP connection reuse with automatic reconnection
+- Persistent TCP connection reuse with automatic reconnection and connection pooling
 - Filtering, Transforming, Broadcasting.
 
 ## Installation
@@ -163,7 +163,7 @@ Custom example: `{alert: 0, notice: 1, ...}`
 
 By default, the `tcp` and `tcp-tls` adapters create a new connection for every message. For high-throughput scenarios (e.g. hundreds of messages per second), you can enable persistent connection reuse with the `keepAlive` option.
 
-When enabled, the adapter maintains a single TCP connection, queues messages during outages, and automatically reconnects with exponential backoff.
+When enabled, the adapter maintains persistent TCP connections, queues messages during outages, and automatically reconnects with exponential backoff.
 
 ```javascript
 log.setConfig({
@@ -173,12 +173,14 @@ log.setConfig({
     port: 12201,
     keepAlive: true,
     keepAliveOptions: {
-      maxQueueSize: 5000,         // max messages buffered while disconnected; default: 5000
+      poolSize: 1,                // number of persistent connections (round-robin); default: 1
+      maxQueueSize: 5000,         // max messages buffered per connection while disconnected; default: 5000
       reconnectBaseDelay: 100,    // initial reconnect delay in ms; default: 100
       reconnectMaxDelay: 5000,    // max reconnect delay in ms (backoff cap); default: 5000
       reconnectMaxAttempts: 0,    // 0 = unlimited retries; default: 0
       writeTimeout: 5000,         // per-message write timeout in ms; default: 5000
-      queueFullBehavior: 'drop-oldest' // 'drop-oldest', 'drop-newest', or 'error'; default: 'drop-oldest'
+      queueFullBehavior: 'drop-oldest', // 'drop-oldest', 'drop-newest', or 'error'; default: 'drop-oldest'
+      onBatchDisconnect: 'retry'  // 'retry' = re-queue in-flight batch; 'drop' = discard; default: 'retry'
     }
   }
 });
@@ -192,12 +194,24 @@ log.close(function () {
 ```
 
 **How it works:**
-- Messages are queued and sent over a single persistent connection using `socket.write()`
-- If the connection drops, messages are buffered and the adapter reconnects automatically
+- Messages are queued and sent over persistent connections using `socket.write()`
+- If a connection drops, messages are buffered and the adapter reconnects automatically
 - Reconnection uses exponential backoff: `100ms -> 200ms -> 400ms -> ... -> 5s (cap)`
-- In-flight messages that fail mid-write are re-queued and retried
+- In-flight messages that fail mid-write are re-queued and retried by default (configurable via `onBatchDisconnect`)
 - When the queue is full, the oldest messages are dropped by default (configurable)
 - Message timestamps are set when `log.info()` is called, not when delivered, so queued messages retain their original timestamps
+
+#### Connection Pooling
+
+Setting `poolSize` greater than 1 creates multiple persistent TCP connections. Messages are distributed across them in round-robin order, multiplying the effective send buffer and increasing throughput.
+
+> **Note on ordering:** With `poolSize` greater than 1, messages may arrive at Graylog in a slightly different order than they were sent. Each connection drains independently, so two messages sent nanoseconds apart may be delivered out of sequence. The GELF `timestamp` field is always set at log time and remains correct, but log viewers that sort by receive time may display events out of order. If strict ordering matters for your logging strategy, keep `poolSize` at 1 or use the UDP adapter, which sends each message independently.
+
+#### Batch Disconnect Policy
+
+The `onBatchDisconnect` option controls what happens to messages that are mid-write when a connection drops:
+- `'retry'` (default): Re-queues the in-flight batch and retries on reconnect. Guarantees at-least-once delivery, but may produce rare duplicates if the server received some messages before the connection was lost.
+- `'drop'`: Discards the in-flight batch and calls their callbacks with an error. Guarantees at-most-once delivery with no duplicates, but accepts potential message loss for the failed batch.
 
 ### Third party adapters
 You can force using custom adapter by setting the `adapter` right after initialisation.  The [signature](lib/adapter/abstract.js) might be found here. 

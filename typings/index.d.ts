@@ -112,7 +112,19 @@ declare module 'gelf-pro' {
        */
       keepAliveOptions?: {
         /**
-         * Max messages buffered while disconnected
+         * Number of persistent TCP connections in the pool (round-robin distribution)
+         * @default 1
+         */
+        poolSize?: number;
+        /**
+         * Behavior when a batch is in-flight during disconnection
+         * 'retry' = re-queue batch (at-least-once, possible rare duplicates)
+         * 'drop' = discard in-flight batch (at-most-once, no duplicates)
+         * @default 'retry'
+         */
+        onBatchDisconnect?: 'retry' | 'drop';
+        /**
+         * Max messages buffered per connection while disconnected
          * @default 5000
          */
         maxQueueSize?: number;
@@ -141,6 +153,11 @@ declare module 'gelf-pro' {
          * @default 'drop-oldest'
          */
         queueFullBehavior?: 'drop-oldest' | 'drop-newest' | 'error';
+        /**
+         * Maximum number of messages to batch into a single socket.write() call
+         * @default 16
+         */
+        batchSize?: number;
       };
       /**
        * @default udp4

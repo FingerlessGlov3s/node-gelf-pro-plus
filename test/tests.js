@@ -521,6 +521,8 @@ module.exports = {
       this.eventEmitter.write = sinon.stub();
       this.eventEmitter.setTimeout = sinon.stub();
       this.eventEmitter.removeAllListeners = sinon.stub();
+      this.eventEmitter.cork = sinon.stub();
+      this.eventEmitter.uncork = sinon.stub();
 
       sinon.stub(this.adapter, '_instance').returns(this.eventEmitter);
       this.adapter.setOptions({
@@ -535,7 +537,7 @@ module.exports = {
     },
 
     'Send message over persistent connection': function (done) {
-      this.eventEmitter.write.callsArg(1);
+      this.eventEmitter.write.callsFake(function (data, cb) { if (cb) { process.nextTick(cb); } });
 
       this.adapter.send('hello', function (err, result) {
         should.not.exist(err);
@@ -549,12 +551,16 @@ module.exports = {
     'Reuse connection for multiple messages': function (done) {
       var self = this;
       var count = 0;
-      this.eventEmitter.write.callsArg(1);
+      this.eventEmitter.write.callsFake(function (data, cb) { if (cb) { process.nextTick(cb); } });
 
       var check = function (err, result) {
         should.not.exist(err);
         if (++count === 3) {
           self.adapter._instance.calledOnce.should.be.true();
+          // 3 messages written in one corked batch
+          self.eventEmitter.write.calledThrice.should.be.true();
+          self.eventEmitter.cork.calledOnce.should.be.true();
+          self.eventEmitter.uncork.calledOnce.should.be.true();
           done();
         }
       };
@@ -568,7 +574,7 @@ module.exports = {
 
     'Queue messages while connecting': function (done) {
       var results = [];
-      this.eventEmitter.write.callsArg(1);
+      this.eventEmitter.write.callsFake(function (data, cb) { if (cb) { process.nextTick(cb); } });
 
       var check = function (err, result) {
         should.not.exist(err);
@@ -600,9 +606,11 @@ module.exports = {
       var emitter2 = new events.EventEmitter();
       emitter2.destroy = sinon.stub();
       emitter2.end = sinon.stub();
-      emitter2.write = sinon.stub().callsArg(1);
+      emitter2.write = sinon.stub().callsFake(function (data, cb) { if (cb) { process.nextTick(cb); } });
       emitter2.setTimeout = sinon.stub();
       emitter2.removeAllListeners = sinon.stub();
+      emitter2.cork = sinon.stub();
+      emitter2.uncork = sinon.stub();
       self.adapter._instance.returns(emitter2);
 
       setTimeout(function () {
@@ -669,9 +677,86 @@ module.exports = {
       var emitter2 = new events.EventEmitter();
       emitter2.destroy = sinon.stub();
       emitter2.end = sinon.stub();
-      emitter2.write = sinon.stub().callsArg(1);
+      emitter2.write = sinon.stub().callsFake(function (data, cb) { if (cb) { process.nextTick(cb); } });
       emitter2.setTimeout = sinon.stub();
       emitter2.removeAllListeners = sinon.stub();
+      emitter2.cork = sinon.stub();
+      emitter2.uncork = sinon.stub();
+      self.adapter._instance.returns(emitter2);
+
+      setTimeout(function () {
+        emitter2.emit('connect');
+      }, 50);
+    },
+
+    'Batch respects batchSize limit': function (done) {
+      var self = this;
+      this.adapter.setOptions({
+        host: 'localhost', port: 5555,
+        keepAlive: true,
+        keepAliveOptions: {maxQueueSize: 10, reconnectBaseDelay: 10, batchSize: 2}
+      });
+
+      var count = 0;
+      this.eventEmitter.write.callsFake(function (data, cb) { if (cb) { process.nextTick(cb); } });
+
+      var check = function (err) {
+        should.not.exist(err);
+        if (++count === 4) {
+          // 4 messages with batchSize=2 => 2 batches => 2 cork/uncork cycles
+          self.eventEmitter.cork.calledTwice.should.be.true();
+          self.eventEmitter.uncork.calledTwice.should.be.true();
+          done();
+        }
+      };
+
+      this.adapter.send('msg1', check);
+      this.adapter.send('msg2', check);
+      this.adapter.send('msg3', check);
+      this.adapter.send('msg4', check);
+
+      this.eventEmitter.emit('connect');
+    },
+
+    'Batch error re-queues all entries': function (done) {
+      var self = this;
+      this.adapter.setOptions({
+        host: 'localhost', port: 5555,
+        keepAlive: true,
+        keepAliveOptions: {maxQueueSize: 10, reconnectBaseDelay: 10, batchSize: 3}
+      });
+
+      // 3 messages with batchSize=3: writes 1,2 have no callback, write 3 has the callback
+      // make the last write (the one with callback) fail
+      this.eventEmitter.write.callsFake(function (data, cb) {
+        if (cb) { process.nextTick(function () { cb(new Error('write failed')); }); }
+      });
+
+      var results = [];
+
+      var check = function (err, result) {
+        should.not.exist(err);
+        results.push(result);
+        if (results.length === 3) {
+          done();
+        }
+      };
+
+      this.adapter.send('msg1', check);
+      this.adapter.send('msg2', check);
+      this.adapter.send('msg3', check);
+
+      this.eventEmitter.emit('connect');
+
+      // set up second connection for reconnect - all 3 should be retried
+      var emitter2 = new events.EventEmitter();
+      emitter2.destroy = sinon.stub();
+      emitter2.end = sinon.stub();
+      emitter2.write = sinon.stub().callsFake(function (data, cb) { if (cb) { process.nextTick(cb); } });
+      emitter2.setTimeout = sinon.stub();
+      emitter2.removeAllListeners = sinon.stub();
+      emitter2.cork = sinon.stub();
+      emitter2.uncork = sinon.stub();
       self.adapter._instance.returns(emitter2);
 
       setTimeout(function () {
@@ -695,6 +780,410 @@ module.exports = {
       });
 
       ee.emit('connect');
+    }
+  },
+
+  'Adapter TCP (keepAlive + connection pool)': {
+    afterEach: function () {
+      if (this.adapter) {
+        this.adapter.close();
+      }
+    },
+
+    'Distributes messages across pool connections (round-robin)': function (done) {
+      var adapter = this.adapter = getAdapter('tcp');
+
+      var emitters = [];
+      for (var i = 0; i < 2; i++) {
+        var ee = new events.EventEmitter();
+        ee.destroy = sinon.stub();
+        ee.end = sinon.stub();
+        ee.write = sinon.stub().callsFake(function (data, cb) { if (cb) { process.nextTick(cb); } });
+        ee.setTimeout = sinon.stub();
+        ee.removeAllListeners = sinon.stub();
+        ee.cork = sinon.stub();
+        ee.uncork = sinon.stub();
+        emitters.push(ee);
+      }
+
+      var callIndex = 0;
+      sinon.stub(adapter, '_instance').callsFake(function () {
+        return emitters[callIndex++];
+      });
+
+      adapter.setOptions({
+        host: 'localhost', port: 5555,
+        keepAlive: true,
+        keepAliveOptions: {poolSize: 2, maxQueueSize: 10, reconnectBaseDelay: 10}
+      });
+
+      var count = 0;
+      var check = function (err) {
+        should.not.exist(err);
+        if (++count === 4) {
+          // Each emitter should have received 2 writes (round-robin)
+          emitters[0].write.callCount.should.equal(2);
+          emitters[1].write.callCount.should.equal(2);
+          done();
+        }
+      };
+
+      adapter.send('msg1', check); // -> slot 0
+      adapter.send('msg2', check); // -> slot 1
+      adapter.send('msg3', check); // -> slot 0
+      adapter.send('msg4', check); // -> slot 1
+
+      emitters[0].emit('connect');
+      emitters[1].emit('connect');
+    },
+
+    'One slot failure does not affect other slots': function (done) {
+      var adapter = this.adapter = getAdapter('tcp');
+
+      var ee0 = new events.EventEmitter();
+      ee0.destroy = sinon.stub();
+      ee0.end = sinon.stub();
+      ee0.write = sinon.stub();
+      ee0.setTimeout = sinon.stub();
+      ee0.removeAllListeners = sinon.stub();
+      ee0.cork = sinon.stub();
+      ee0.uncork = sinon.stub();
+
+      var ee1 = new events.EventEmitter();
+      ee1.destroy = sinon.stub();
+      ee1.end = sinon.stub();
+      ee1.write = sinon.stub().callsFake(function (data, cb) { if (cb) { process.nextTick(cb); } });
+      ee1.setTimeout = sinon.stub();
+      ee1.removeAllListeners = sinon.stub();
+      ee1.cork = sinon.stub();
+      ee1.uncork = sinon.stub();
+
+      var callIndex = 0;
+      sinon.stub(adapter, '_instance').callsFake(function () {
+        return [ee0, ee1][callIndex++];
+      });
+
+      adapter.setOptions({
+        host: 'localhost', port: 5555,
+        keepAlive: true,
+        keepAliveOptions: {poolSize: 2, maxQueueSize: 10, reconnectBaseDelay: 100000}
+      });
+
+      var msg2Done = false;
+
+      adapter.send('msg1', function () {}); // -> slot 0 (will hang)
+      adapter.send('msg2', function (err) { // -> slot 1 (will succeed)
+        should.not.exist(err);
+        msg2Done = true;
+      });
+
+      ee0.emit('connect');
+      ee1.emit('connect');
+
+      // Fail slot 0 after a tick
+      process.nextTick(function () {
+        ee0.emit('error', new Error('slot 0 died'));
+      });
+
+      setTimeout(function () {
+        msg2Done.should.be.true();
+        done();
+      }, 100);
+    },
+
+    'close() tears down all pool connections': function (done) {
+      var adapter = this.adapter = getAdapter('tcp');
+
+      var emitters = [];
+      for (var i = 0; i < 3; i++) {
+        var ee = new events.EventEmitter();
+        ee.destroy = sinon.stub();
+        ee.end = sinon.stub();
+        ee.write = sinon.stub();
+        ee.setTimeout = sinon.stub();
+        ee.removeAllListeners = sinon.stub();
+        ee.cork = sinon.stub();
+        ee.uncork = sinon.stub();
+        emitters.push(ee);
+      }
+
+      var ci = 0;
+      sinon.stub(adapter, '_instance').callsFake(function () { return emitters[ci++]; });
+
+      adapter.setOptions({
+        host: 'localhost', port: 5555,
+        keepAlive: true,
+        keepAliveOptions: {poolSize: 3, maxQueueSize: 10, reconnectBaseDelay: 100000}
+      });
+
+      var errors = [];
+      adapter.send('msg1', function (err) { if (err) { errors.push(err); } });
+      adapter.send('msg2', function (err) { if (err) { errors.push(err); } });
+      adapter.send('msg3', function (err) { if (err) { errors.push(err); } });
+
+      adapter.close(function () {
+        errors.should.have.length(3);
+        errors.forEach(function (e) { e.message.should.equal('Adapter closed'); });
+        done();
+      });
+    },
+
+    'Per-slot queue overflow is independent': function (done) {
+      var adapter = this.adapter = getAdapter('tcp');
+
+      var emitters = [];
+      for (var i = 0; i < 2; i++) {
+        var ee = new events.EventEmitter();
+        ee.destroy = sinon.stub();
+        ee.end = sinon.stub();
+        ee.write = sinon.stub().callsFake(function (data, cb) { if (cb) { process.nextTick(cb); } });
+        ee.setTimeout = sinon.stub();
+        ee.removeAllListeners = sinon.stub();
+        ee.cork = sinon.stub();
+        ee.uncork = sinon.stub();
+        emitters.push(ee);
+      }
+
+      var ci = 0;
+      sinon.stub(adapter, '_instance').callsFake(function () { return emitters[ci++]; });
+
+      adapter.setOptions({
+        host: 'localhost', port: 5555,
+        keepAlive: true,
+        keepAliveOptions: {poolSize: 2, maxQueueSize: 2, reconnectBaseDelay: 100000}
+      });
+
+      var dropped = false;
+      var slot1Msgs = [];
+
+      // Fill slot 0's queue (maxQueueSize=2)
+      adapter.send('s0-msg1', function (err) {
+        if (err && err.message.match(/overflow/)) { dropped = true; }
+      }); // slot 0
+      adapter.send('s1-msg1', function (err, result) {
+        if (!err) { slot1Msgs.push(result); }
+      }); // slot 1
+      adapter.send('s0-msg2', function () {}); // slot 0 (queue now full)
+      adapter.send('s1-msg2', function (err, result) {
+        if (!err) { slot1Msgs.push(result); }
+      }); // slot 1
+
+      // Overflow slot 0's queue - should drop s0-msg1
+      adapter.send('s0-msg3', function () {}); // slot 0 (overflow!)
+
+      process.nextTick(function () {
+        dropped.should.be.true();
+
+        // Slot 1 should still work fine - connect it
+        emitters[1].emit('connect');
+
+        setTimeout(function () {
+          slot1Msgs.should.have.length(2);
+          done();
+        }, 50);
+      });
+    },
+
+    'Per-slot reconnect is independent': function (done) {
+      var adapter = this.adapter = getAdapter('tcp');
+
+      var ee0 = new events.EventEmitter();
+      ee0.destroy = sinon.stub();
+      ee0.end = sinon.stub();
+      ee0.write = sinon.stub().callsFake(function (data, cb) { if (cb) { process.nextTick(cb); } });
+      ee0.setTimeout = sinon.stub();
+      ee0.removeAllListeners = sinon.stub();
+      ee0.cork = sinon.stub();
+      ee0.uncork = sinon.stub();
+
+      var ee1 = new events.EventEmitter();
+      ee1.destroy = sinon.stub();
+      ee1.end = sinon.stub();
+      ee1.write = sinon.stub().callsFake(function (data, cb) { if (cb) { process.nextTick(cb); } });
+      ee1.setTimeout = sinon.stub();
+      ee1.removeAllListeners = sinon.stub();
+      ee1.cork = sinon.stub();
+      ee1.uncork = sinon.stub();
+
+      var ee0b = new events.EventEmitter();
+      ee0b.destroy = sinon.stub();
+      ee0b.end = sinon.stub();
+      ee0b.write = sinon.stub().callsFake(function (data, cb) { if (cb) { process.nextTick(cb); } });
+      ee0b.setTimeout = sinon.stub();
+      ee0b.removeAllListeners = sinon.stub();
+      ee0b.cork = sinon.stub();
+      ee0b.uncork = sinon.stub();
+
+      var callIndex = 0;
+      var sockets = [ee0, ee1, ee0b];
+      sinon.stub(adapter, '_instance').callsFake(function () {
+        return sockets[callIndex++];
+      });
+
+      adapter.setOptions({
+        host: 'localhost', port: 5555,
+        keepAlive: true,
+        keepAliveOptions: {poolSize: 2, maxQueueSize: 10, reconnectBaseDelay: 10}
+      });
+
+      var results = [];
+
+      adapter.send('msg1', function (err, result) { // -> slot 0
+        if (!err) { results.push({slot: 0, result: result}); }
+      });
+      adapter.send('msg2', function (err, result) { // -> slot 1
+        if (!err) { results.push({slot: 1, result: result}); }
+      });
+
+      // Connect both
+      ee0.emit('connect');
+      ee1.emit('connect');
+
+      setTimeout(function () {
+        // Slot 1 should have delivered while slot 0 was failing
+        results.should.have.length(2);
+
+        // Now fail slot 0 and send another message to it
+        ee0.emit('error', new Error('slot 0 failed'));
+
+        adapter.send('msg3', function () {}); // -> slot 0 (reconnecting)
+        adapter.send('msg4', function (err, result) { // -> slot 1 (still connected)
+          should.not.exist(err);
+          // slot 1 still works after slot 0 failure
+          done();
+        });
+
+        // Drain slot 1 for msg4
+        ee1.write.callsFake(function (data, cb) { if (cb) { process.nextTick(cb); } });
+        adapter._drain(adapter._pool[1]);
+      }, 50);
+    },
+
+    'poolSize defaults to 1 (backward compatibility)': function (done) {
+      var adapter = this.adapter = getAdapter('tcp');
+
+      var ee = new events.EventEmitter();
+      ee.destroy = sinon.stub();
+      ee.end = sinon.stub();
+      ee.write = sinon.stub().callsFake(function (data, cb) { if (cb) { process.nextTick(cb); } });
+      ee.setTimeout = sinon.stub();
+      ee.removeAllListeners = sinon.stub();
+      ee.cork = sinon.stub();
+      ee.uncork = sinon.stub();
+
+      sinon.stub(adapter, '_instance').returns(ee);
+      adapter.setOptions({
+        host: 'localhost', port: 5555,
+        keepAlive: true,
+        keepAliveOptions: {maxQueueSize: 10, reconnectBaseDelay: 10}
+      });
+
+      adapter.send('hello', function (err, result) {
+        should.not.exist(err);
+        result.should.equal(6);
+        adapter._pool.should.have.length(1);
+        done();
+      });
+
+      ee.emit('connect');
+    }
+  },
+
+  'Adapter TCP (onBatchDisconnect)': {
+    afterEach: function () {
+      if (this.adapter) {
+        this.adapter.close();
+      }
+    },
+
+    'retry (default) re-queues batch on disconnect': function (done) {
+      var adapter = this.adapter = getAdapter('tcp');
+
+      var ee1 = new events.EventEmitter();
+      ee1.destroy = sinon.stub();
+      ee1.end = sinon.stub();
+      ee1.write = sinon.stub();
+      ee1.setTimeout = sinon.stub();
+      ee1.removeAllListeners = sinon.stub();
+      ee1.cork = sinon.stub();
+      ee1.uncork = sinon.stub();
+
+      var ee2 = new events.EventEmitter();
+      ee2.destroy = sinon.stub();
+      ee2.end = sinon.stub();
+      ee2.write = sinon.stub().callsFake(function (data, cb) { if (cb) { process.nextTick(cb); } });
+      ee2.setTimeout = sinon.stub();
+      ee2.removeAllListeners = sinon.stub();
+      ee2.cork = sinon.stub();
+      ee2.uncork = sinon.stub();
+
+      var callIndex = 0;
+      sinon.stub(adapter, '_instance').callsFake(function () {
+        return [ee1, ee2][callIndex++];
+      });
+
+      adapter.setOptions({
+        host: 'localhost', port: 5555,
+        keepAlive: true,
+        keepAliveOptions: {maxQueueSize: 10, reconnectBaseDelay: 10, onBatchDisconnect: 'retry'}
+      });
+
+      // first write: don't call callback, then disconnect
+      ee1.write.onFirstCall().callsFake(function () {
+        process.nextTick(function () {
+          ee1.emit('error', new Error('Connection lost'));
+        });
+      });
+
+      adapter.send('hello', function (err, result) {
+        // should succeed on second connection (re-queued and retried)
+        should.not.exist(err);
+        result.should.equal(6);
+        done();
+      });
+
+      ee1.emit('connect');
+
+      setTimeout(function () {
+        ee2.emit('connect');
+      }, 50);
+    },
+
+    'drop discards batch on disconnect': function (done) {
+      var adapter = this.adapter = getAdapter('tcp');
+
+      var ee1 = new events.EventEmitter();
+      ee1.destroy = sinon.stub();
+      ee1.end = sinon.stub();
+      ee1.write = sinon.stub();
+      ee1.setTimeout = sinon.stub();
+      ee1.removeAllListeners = sinon.stub();
+      ee1.cork = sinon.stub();
+      ee1.uncork = sinon.stub();
+
+      sinon.stub(adapter, '_instance').returns(ee1);
+
+      adapter.setOptions({
+        host: 'localhost', port: 5555,
+        keepAlive: true,
+        keepAliveOptions: {maxQueueSize: 10, reconnectBaseDelay: 100000, onBatchDisconnect: 'drop'}
+      });
+
+      // first write: don't call callback, then disconnect
+      ee1.write.onFirstCall().callsFake(function () {
+        process.nextTick(function () {
+          ee1.emit('error', new Error('Connection lost'));
+        });
+      });
+
+      adapter.send('hello', function (err) {
+        // should get an error, NOT be retried
+        should.exist(err);
+        err.message.should.equal('Connection lost');
+        done();
+      });
+
+      ee1.emit('connect');
     }
   },
 
