@@ -1191,7 +1191,13 @@ module.exports = {
     'Abstract functionality': function () {
       var tls = require('tls'),
         adapter = getAdapter('tcp-tls');
-      adapter._instance({host: 'google.com', port: 5555}).should.be.instanceOf(tls.TLSSocket);
+      var socket = adapter._instance({host: 'google.com', port: 5555});
+      socket.should.be.instanceOf(tls.TLSSocket);
+      // Tear the socket down so it can't later raise an uncaught ETIMEDOUT
+      // (Node's Happy Eyeballs parallel connect can surface AggregateError
+      // long after the test finishes, polluting later async tests).
+      socket.on('error', function () {});
+      socket.destroy();
     }
   },
 
@@ -1365,16 +1371,22 @@ module.exports = {
 
   'Adapter TCP (backoff under load)': {
     afterEach: function () {
+      if (this.clock) {
+        this.clock.restore();
+        this.clock = null;
+      }
       if (this.adapter) {
         this.adapter.events.removeAllListeners();
         this.adapter.close();
       }
     },
 
-    'New sends do not collapse exponential backoff': function (done) {
+    'New sends do not collapse exponential backoff': function () {
+      // Drive setTimeout via sinon fake timers so the test is deterministic
+      // and never waits on real wall time.
+      this.clock = sinon.useFakeTimers();
       this.adapter = getAdapter('tcp');
 
-      // every connection attempt instantiates a new failing socket
       var sockets = [];
       sinon.stub(this.adapter, '_instance').callsFake(function () {
         var ee = new events.EventEmitter();
@@ -1386,10 +1398,6 @@ module.exports = {
         ee.cork = sinon.stub();
         ee.uncork = sinon.stub();
         sockets.push(ee);
-        // fail this connection on the next tick
-        process.nextTick(function () {
-          ee.emit('error', new Error('refused'));
-        });
         return ee;
       });
 
@@ -1404,24 +1412,32 @@ module.exports = {
         schedules.push(p);
       });
 
-      // fire off many sends rapidly while the slot is failing to connect
-      var self = this;
-      var sendBurst = function () {
-        for (var i = 0; i < 8; i++) {
-          self.adapter.send('msg' + i, function () {});
-        }
-      };
-      sendBurst();
+      // first send creates a connecting socket; fail it to schedule reconnect #1
+      this.adapter.send('msg0', function () {});
+      sockets[0].emit('error', new Error('initial'));
 
-      // give the failures and reconnect timer enough time for at least 2 schedules
-      setTimeout(function () {
-        // OLD (broken) behavior: every send reset attempts to 0, so every
-        // schedule had attempt=1 / delay=base. Fixed behavior: attempts grow.
-        schedules.length.should.be.greaterThan(1);
-        var attempts = schedules.map(function (s) { return s.attempt; });
-        Math.max.apply(null, attempts).should.be.greaterThan(1);
-        done();
-      }, 250);
+      // burst more sends DURING the backoff. Under the OLD bug these would
+      // each reset reconnectAttempts and cancel the timer, so every schedule
+      // would have attempt=1. Under the fix the attempt counter grows.
+      for (var i = 1; i < 8; i++) {
+        this.adapter.send('msg' + i, function () {});
+      }
+
+      // advance through several backoff cycles, failing each new socket
+      for (var cycle = 0; cycle < 3; cycle++) {
+        this.clock.runToLast(); // fire the next pending timeout
+        // _connect ran synchronously inside that timer, so a new socket exists
+        var fresh = sockets[sockets.length - 1];
+        fresh.emit('error', new Error('still down'));
+      }
+
+      schedules.length.should.be.greaterThanOrEqual(3);
+      var attempts = schedules.map(function (s) { return s.attempt; });
+      attempts.should.containDeep([1, 2, 3]);
+      var delays = schedules.map(function (s) { return s.delayMs; });
+      // 50, 100, 200, ... — strictly growing, NOT stuck at base
+      delays[1].should.be.greaterThan(delays[0]);
+      delays[2].should.be.greaterThan(delays[1]);
     }
   }
 };
