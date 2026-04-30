@@ -1193,5 +1193,235 @@ module.exports = {
         adapter = getAdapter('tcp-tls');
       adapter._instance({host: 'google.com', port: 5555}).should.be.instanceOf(tls.TLSSocket);
     }
+  },
+
+  'Adapter TCP (lifecycle events)': {
+    beforeEach: function () {
+      this.adapter = getAdapter('tcp');
+
+      this.eventEmitter = new events.EventEmitter();
+      this.eventEmitter.destroy = sinon.stub();
+      this.eventEmitter.end = sinon.stub();
+      this.eventEmitter.write = sinon.stub();
+      this.eventEmitter.setTimeout = sinon.stub();
+      this.eventEmitter.removeAllListeners = sinon.stub();
+      this.eventEmitter.cork = sinon.stub();
+      this.eventEmitter.uncork = sinon.stub();
+
+      sinon.stub(this.adapter, '_instance').returns(this.eventEmitter);
+      this.adapter.setOptions({
+        host: 'localhost', port: 5555,
+        keepAlive: true,
+        keepAliveOptions: {maxQueueSize: 2, reconnectBaseDelay: 10}
+      });
+
+      // Each test adapter inherits the singleton's `events` emitter via
+      // prototype. Strip stale listeners so tests don't pollute each other.
+      this.adapter.events.removeAllListeners();
+    },
+
+    afterEach: function () {
+      this.adapter.events.removeAllListeners();
+      this.adapter.close();
+    },
+
+    'Emits connect with slotIndex on successful connect': function (done) {
+      this.adapter.events.on('connect', function (payload) {
+        payload.should.have.property('slotIndex', 0);
+        done();
+      });
+
+      this.eventEmitter.write.callsFake(function (data, cb) { if (cb) { process.nextTick(cb); } });
+      this.adapter.send('hello', function () {});
+      this.eventEmitter.emit('connect');
+    },
+
+    'Emits disconnect with error and queueSize on connection loss': function (done) {
+      var self = this;
+      this.adapter.events.on('disconnect', function (payload) {
+        payload.should.have.property('slotIndex', 0);
+        payload.error.message.should.equal('boom');
+        payload.queueSize.should.be.a.Number();
+        done();
+      });
+
+      this.adapter.send('hello', function () {});
+      this.eventEmitter.emit('connect');
+      // schedule the error after connect so the slot is in 'connected' state
+      process.nextTick(function () {
+        self.eventEmitter.emit('error', new Error('boom'));
+      });
+    },
+
+    'Emits reconnectScheduled with delayMs and attempt': function (done) {
+      var attempts = [];
+      this.adapter.events.on('reconnectScheduled', function (payload) {
+        attempts.push(payload);
+        if (attempts.length === 1) {
+          payload.should.have.property('slotIndex', 0);
+          payload.delayMs.should.equal(10); // base * 2^0
+          payload.attempt.should.equal(1);
+          done();
+        }
+      });
+
+      this.adapter.send('hello', function () {});
+      this.eventEmitter.emit('error', new Error('initial fail'));
+    },
+
+    'Emits queueOverflow when queue fills': function (done) {
+      var fired = false;
+      this.adapter.events.on('queueOverflow', function (payload) {
+        if (fired) { return; }
+        fired = true;
+        payload.should.have.property('slotIndex', 0);
+        payload.behavior.should.equal('drop-oldest');
+        done();
+      });
+
+      // maxQueueSize=2: send 3 messages while connecting -> overflow on 3rd
+      this.adapter.send('msg1', function () {});
+      this.adapter.send('msg2', function () {});
+      this.adapter.send('msg3', function () {});
+    },
+
+    'Emits giveUp when reconnectMaxAttempts is hit': function (done) {
+      this.adapter.setOptions({
+        host: 'localhost', port: 5555,
+        keepAlive: true,
+        keepAliveOptions: {maxQueueSize: 10, reconnectBaseDelay: 10, reconnectMaxAttempts: 1}
+      });
+
+      this.adapter.events.on('giveUp', function (payload) {
+        payload.should.have.property('slotIndex', 0);
+        payload.queueSize.should.be.a.Number();
+        done();
+      });
+
+      this.adapter.send('hello', function () {});
+      // first attempt fails -> reconnectAttempts becomes 1 -> next disconnect hits the cap
+      this.eventEmitter.emit('error', new Error('fail 1'));
+      // a second message triggers a reconnect, which fails again and trips give-up
+      var self = this;
+      setTimeout(function () {
+        self.adapter.send('hello2', function () {});
+        self.eventEmitter.emit('error', new Error('fail 2'));
+      }, 30);
+    }
+  },
+
+  'Adapter TCP (getStats)': {
+    afterEach: function () {
+      if (this.adapter) {
+        this.adapter.events.removeAllListeners();
+        this.adapter.close();
+      }
+    },
+
+    'Returns initialized:false before any send': function () {
+      this.adapter = getAdapter('tcp');
+      this.adapter.setOptions({
+        host: 'localhost', port: 5555,
+        keepAlive: true, keepAliveOptions: {}
+      });
+      var stats = this.adapter.getStats();
+      stats.initialized.should.be.false();
+      stats.slots.should.have.length(0);
+    },
+
+    'Reports per-slot state and queue size': function (done) {
+      this.adapter = getAdapter('tcp');
+
+      var ee = new events.EventEmitter();
+      ee.destroy = sinon.stub();
+      ee.end = sinon.stub();
+      ee.write = sinon.stub();
+      ee.setTimeout = sinon.stub();
+      ee.removeAllListeners = sinon.stub();
+      ee.cork = sinon.stub();
+      ee.uncork = sinon.stub();
+
+      sinon.stub(this.adapter, '_instance').returns(ee);
+      this.adapter.setOptions({
+        host: 'localhost', port: 5555,
+        keepAlive: true,
+        keepAliveOptions: {poolSize: 2, maxQueueSize: 10, reconnectBaseDelay: 100000}
+      });
+
+      this.adapter.send('msg1', function () {});
+      this.adapter.send('msg2', function () {});
+
+      var stats = this.adapter.getStats();
+      stats.initialized.should.be.true();
+      stats.poolClosed.should.be.false();
+      stats.slots.should.have.length(2);
+      stats.slots[0].index.should.equal(0);
+      stats.slots[0].queueSize.should.equal(1);
+      stats.slots[1].index.should.equal(1);
+      stats.slots[1].queueSize.should.equal(1);
+      done();
+    }
+  },
+
+  'Adapter TCP (backoff under load)': {
+    afterEach: function () {
+      if (this.adapter) {
+        this.adapter.events.removeAllListeners();
+        this.adapter.close();
+      }
+    },
+
+    'New sends do not collapse exponential backoff': function (done) {
+      this.adapter = getAdapter('tcp');
+
+      // every connection attempt instantiates a new failing socket
+      var sockets = [];
+      sinon.stub(this.adapter, '_instance').callsFake(function () {
+        var ee = new events.EventEmitter();
+        ee.destroy = sinon.stub();
+        ee.end = sinon.stub();
+        ee.write = sinon.stub();
+        ee.setTimeout = sinon.stub();
+        ee.removeAllListeners = sinon.stub();
+        ee.cork = sinon.stub();
+        ee.uncork = sinon.stub();
+        sockets.push(ee);
+        // fail this connection on the next tick
+        process.nextTick(function () {
+          ee.emit('error', new Error('refused'));
+        });
+        return ee;
+      });
+
+      this.adapter.setOptions({
+        host: 'localhost', port: 5555,
+        keepAlive: true,
+        keepAliveOptions: {maxQueueSize: 100, reconnectBaseDelay: 50, reconnectMaxDelay: 5000}
+      });
+
+      var schedules = [];
+      this.adapter.events.on('reconnectScheduled', function (p) {
+        schedules.push(p);
+      });
+
+      // fire off many sends rapidly while the slot is failing to connect
+      var self = this;
+      var sendBurst = function () {
+        for (var i = 0; i < 8; i++) {
+          self.adapter.send('msg' + i, function () {});
+        }
+      };
+      sendBurst();
+
+      // give the failures and reconnect timer enough time for at least 2 schedules
+      setTimeout(function () {
+        // OLD (broken) behavior: every send reset attempts to 0, so every
+        // schedule had attempt=1 / delay=base. Fixed behavior: attempts grow.
+        schedules.length.should.be.greaterThan(1);
+        var attempts = schedules.map(function (s) { return s.attempt; });
+        Math.max.apply(null, attempts).should.be.greaterThan(1);
+        done();
+      }, 250);
+    }
   }
 };

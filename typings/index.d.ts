@@ -18,9 +18,40 @@
 
 declare module 'gelf-pro' {
 
+  import { EventEmitter } from 'events';
+
   export type Message = string | Error;
   export type MessageExtra = object | Error;
   export type MessageCallback = (error?: Error, packetLength?: number) => void;
+
+  export interface SlotStats {
+    /** Slot index within the connection pool. */
+    index: number;
+    /** Current state of the slot. */
+    state: 'disconnected' | 'connecting' | 'connected' | 'closed';
+    /** Number of messages currently waiting in this slot's queue. */
+    queueSize: number;
+    /** Number of consecutive failed reconnect attempts since the last successful connect. */
+    reconnectAttempts: number;
+    /** Whether a backoff timer is currently pending for this slot. */
+    reconnectScheduled: boolean;
+    /** Number of messages currently in flight (mid-write) for this slot. */
+    inflightCount: number;
+  }
+
+  export interface AdapterStats {
+    /** False until the first message has been sent (the pool is created lazily). */
+    initialized: boolean;
+    /** True after close() has been called. */
+    poolClosed: boolean;
+    slots: SlotStats[];
+  }
+
+  export interface ConnectEvent { slotIndex: number; }
+  export interface DisconnectEvent { slotIndex: number; error: Error | null; queueSize: number; }
+  export interface ReconnectScheduledEvent { slotIndex: number; delayMs: number; attempt: number; }
+  export interface QueueOverflowEvent { slotIndex: number; behavior: 'drop-oldest' | 'drop-newest' | 'error'; }
+  export interface GiveUpEvent { slotIndex: number; queueSize: number; }
 
   export function setConfig(opts: Partial<Settings>): Logger;
 
@@ -54,6 +85,25 @@ declare module 'gelf-pro' {
     send(message: Message, callback: MessageCallback): void;
 
     close(callback?: () => void): void;
+
+    /**
+     * Lifecycle event bus (TCP adapters only — UDP does not emit events).
+     *
+     * Note: the adapter is a module singleton, so all consumers in the same
+     * process share the same emitter. Events:
+     *  - 'connect' (ConnectEvent) — slot transitioned to connected
+     *  - 'disconnect' (DisconnectEvent) — slot lost its connection
+     *  - 'reconnectScheduled' (ReconnectScheduledEvent) — backoff timer set
+     *  - 'queueOverflow' (QueueOverflowEvent) — message dropped or rejected
+     *  - 'giveUp' (GiveUpEvent) — reconnectMaxAttempts hit; queue errored out
+     */
+    events: EventEmitter;
+
+    /**
+     * Snapshot of the connection pool's current state. Safe to call before
+     * the pool is initialized (returns initialized:false).
+     */
+    getStats(): AdapterStats;
   }
 
   export interface Settings {
